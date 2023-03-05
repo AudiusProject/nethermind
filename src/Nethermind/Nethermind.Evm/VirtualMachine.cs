@@ -1213,7 +1213,6 @@ namespace Nethermind.Evm
                             {
                                 Debug.Assert(callState is not null);
                                 UpdateCurrentState(vmState, programCounter, gasAvailable, stack.Head);
-                                if (traceOpcodes) EndInstructionTrace(gasAvailable, vmState.Memory?.Size ?? 0);
                                 return new CallResult(callState);
                             }
                             Debug.Assert(result == InstructionReturn.Continue);
@@ -1223,16 +1222,12 @@ namespace Nethermind.Evm
                         {
                             if (!spec.RevertOpcodeEnabled) goto InvalidInstruction;
 
-                            stack.PopUInt256(out UInt256 memoryPos);
-                            stack.PopUInt256(out UInt256 length);
+                            (InstructionReturn result, byte[]? message) = InstructionREVERT(ref stack, ref gasAvailable, vmState);
+                            if (result == InstructionReturn.OutOfGas) goto OutOfGas;
 
-                            if (!UpdateMemoryCost(vmState.Memory, ref gasAvailable, in memoryPos, length)) goto OutOfGas;
-
-                            ReadOnlyMemory<byte> errorDetails = vmState.Memory.Load(in memoryPos, length);
-
+                            Debug.Assert(result == InstructionReturn.Success);
                             UpdateCurrentState(vmState, programCounter, gasAvailable, stack.Head);
-                            if (traceOpcodes) EndInstructionTrace(gasAvailable, vmState.Memory?.Size ?? 0);
-                            return new CallResult(errorDetails.ToArray(), null, true);
+                            return new CallResult(message, null, true);
                         }
                     case Instruction.INVALID:
                         {
@@ -1271,8 +1266,7 @@ namespace Nethermind.Evm
                             if (!spec.SubroutinesEnabled) goto InvalidInstruction;
                             if (!UpdateGas(GasCostOf.Base, ref gasAvailable)) goto OutOfGas;
 
-                            if (traceOpcodes) EndInstructionTraceError(gasAvailable, EvmExceptionType.InvalidSubroutineEntry);
-                            return CallResult.InvalidSubroutineEntry;
+                            goto InvalidSubroutineEntry;
                         }
                     case Instruction.RETURNSUB:
                         {
@@ -1281,8 +1275,7 @@ namespace Nethermind.Evm
 
                             if (vmState.ReturnStackHead == 0)
                             {
-                                if (traceOpcodes) EndInstructionTraceError(gasAvailable, EvmExceptionType.InvalidSubroutineReturn);
-                                return CallResult.InvalidSubroutineReturn;
+                                goto InvalidSubroutineReturn;
                             }
 
                             programCounter = vmState.ReturnStack[--vmState.ReturnStackHead];
@@ -1295,8 +1288,7 @@ namespace Nethermind.Evm
 
                             if (vmState.ReturnStackHead == EvmStack.ReturnStackSize)
                             {
-                                if (traceOpcodes) EndInstructionTraceError(gasAvailable, EvmExceptionType.StackOverflow);
-                                return CallResult.StackOverflowException;
+                                goto StackOverflowException;
                             }
 
                             vmState.ReturnStack[vmState.ReturnStackHead++] = programCounter;
@@ -1319,7 +1311,7 @@ namespace Nethermind.Evm
             UpdateCurrentState(vmState, programCounter, gasAvailable, stack.Head);
 // Fall through to Empty: label
 
-// Common exit errors, goto labels to reduce in loop code duplication
+// Common exit errors, goto labels to reduce in loop code duplication and to keep loop body smaller
 Empty:
             return CallResult.Empty;
 OutOfGas:
@@ -1331,6 +1323,15 @@ InvalidInstruction:
 StaticCallViolation:
             if (traceOpcodes) EndInstructionTraceError(gasAvailable, EvmExceptionType.StaticCallViolation);
             return CallResult.StaticCallViolationException;
+InvalidSubroutineEntry:
+            if (traceOpcodes) EndInstructionTraceError(gasAvailable, EvmExceptionType.InvalidSubroutineEntry);
+            return CallResult.InvalidSubroutineEntry;
+InvalidSubroutineReturn:
+            if (traceOpcodes) EndInstructionTraceError(gasAvailable, EvmExceptionType.InvalidSubroutineReturn);
+            return CallResult.InvalidSubroutineReturn;
+StackOverflowException:
+            if (traceOpcodes) EndInstructionTraceError(gasAvailable, EvmExceptionType.StackOverflow);
+            return CallResult.StackOverflowException;
         }
 
         [MethodImpl(MethodImplOptions.NoInlining)]
