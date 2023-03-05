@@ -3,9 +3,10 @@
 
 using System;
 using System.Collections.Generic;
+using System.Diagnostics.CodeAnalysis;
+using System.Diagnostics;
 using System.Numerics;
 using System.Runtime.CompilerServices;
-using System.Runtime.InteropServices;
 using Nethermind.Core;
 using Nethermind.Core.Caching;
 using Nethermind.Core.Crypto;
@@ -19,9 +20,6 @@ using Nethermind.Evm.Precompiles.Snarks.Shamatar;
 using Nethermind.Evm.Tracing;
 using Nethermind.Logging;
 using Nethermind.State;
-using System.Runtime.Intrinsics;
-using System.Diagnostics.CodeAnalysis;
-using System.Diagnostics;
 
 [assembly: InternalsVisibleTo("Nethermind.Evm.Test")]
 
@@ -638,7 +636,7 @@ namespace Nethermind.Evm
 
             if (vmState.Env.CodeInfo.MachineCode.Length == 0)
             {
-                return CallResult.Empty;
+                goto Empty;
             }
 
             vmState.InitStacks();
@@ -701,13 +699,12 @@ namespace Nethermind.Evm
 
             if (previousCallOutput.Length > 0)
             {
-                UInt256 localPreviousDest = previousCallOutputDestination;
-                if (!UpdateMemoryCost(vmState.Memory, ref gasAvailable, in localPreviousDest, (ulong)previousCallOutput.Length))
+                if (!UpdateMemoryCost(vmState.Memory, ref gasAvailable, in previousCallOutputDestination, (ulong)previousCallOutput.Length))
                 {
                     goto OutOfGas;
                 }
 
-                vmState.Memory.Save(in localPreviousDest, previousCallOutput);
+                vmState.Memory.Save(in previousCallOutputDestination, previousCallOutput);
                 //                if(traceOpcodes) _txTracer.ReportMemoryChange((long)localPreviousDest, previousCallOutput);
             }
 
@@ -727,7 +724,7 @@ namespace Nethermind.Evm
                         {
                             UpdateCurrentState(vmState, programCounter, gasAvailable, stack.Head);
                             if (traceOpcodes) EndInstructionTrace(gasAvailable, vmState.Memory?.Size ?? 0);
-                            return CallResult.Empty;
+                            goto Empty;
                         }
                     case Instruction.ADD:
                         {
@@ -1616,59 +1613,17 @@ namespace Nethermind.Evm
                             if (vmState.IsStatic) goto StaticCallViolation;
                             if (spec.UseShanghaiDDosProtection && !UpdateGas(GasCostOf.SelfDestructEip150, ref gasAvailable)) goto OutOfGas;
 
-                            Metrics.SelfDestructs++;
-
-                            Address inheritor = stack.PopAddress();
-                            if (!ChargeAccountAccessGas(ref gasAvailable, vmState, inheritor, spec, false)) goto OutOfGas;
-
-                            vmState.DestroyList.Add(env.ExecutingAccount);
-
-                            UInt256 ownerBalance = _state.GetBalance(env.ExecutingAccount);
-                            if (_txTracer.IsTracingActions) _txTracer.ReportSelfDestruct(env.ExecutingAccount, ownerBalance, inheritor);
-                            if (spec.ClearEmptyAccountWhenTouched && ownerBalance != 0 && _state.IsDeadAccount(inheritor))
-                            {
-                                if (!UpdateGas(GasCostOf.NewAccount, ref gasAvailable)) goto OutOfGas;
-                            }
-
-                            bool inheritorAccountExists = _state.AccountExists(inheritor);
-                            if (!spec.ClearEmptyAccountWhenTouched && !inheritorAccountExists && spec.UseShanghaiDDosProtection)
-                            {
-                                if (!UpdateGas(GasCostOf.NewAccount, ref gasAvailable)) goto OutOfGas;
-                            }
-
-                            if (!inheritorAccountExists)
-                            {
-                                _state.CreateAccount(inheritor, ownerBalance);
-                            }
-                            else if (!inheritor.Equals(env.ExecutingAccount))
-                            {
-                                _state.AddToBalance(inheritor, ownerBalance, spec);
-                            }
-
-                            _state.SubtractFromBalance(env.ExecutingAccount, ownerBalance, spec);
+                            if (!InstructionSELFDESTRUCT(ref stack, ref gasAvailable, vmState, env.ExecutingAccount, spec)) goto OutOfGas;
 
                             UpdateCurrentState(vmState, programCounter, gasAvailable, stack.Head);
-                            if (traceOpcodes) EndInstructionTrace(gasAvailable, vmState.Memory?.Size ?? 0);
-                            return CallResult.Empty;
+                            goto Empty;
                         }
                     case Instruction.SHL:
                         {
                             if (!spec.ShiftOpcodesEnabled) goto InvalidInstruction;
                             if (!UpdateGas(GasCostOf.VeryLow, ref gasAvailable)) goto OutOfGas;
 
-                            stack.PopUInt256(out UInt256 a);
-                            if (a >= 256UL)
-                            {
-                                stack.PopLimbo();
-                                stack.PushZero();
-                            }
-                            else
-                            {
-                                stack.PopUInt256(out UInt256 b);
-                                UInt256 res = b << (int)a.u0;
-                                stack.PushUInt256(in res);
-                            }
-
+                            InstructionSHL(ref stack);
                             break;
                         }
                     case Instruction.SHR:
@@ -1676,19 +1631,7 @@ namespace Nethermind.Evm
                             if (!spec.ShiftOpcodesEnabled) goto InvalidInstruction;
                             if (!UpdateGas(GasCostOf.VeryLow, ref gasAvailable)) goto OutOfGas;
 
-                            stack.PopUInt256(out UInt256 a);
-                            if (a >= 256)
-                            {
-                                stack.PopLimbo();
-                                stack.PushZero();
-                            }
-                            else
-                            {
-                                stack.PopUInt256(out UInt256 b);
-                                UInt256 res = b >> (int)a.u0;
-                                stack.PushUInt256(in res);
-                            }
-
+                            InstructionSHR(ref stack);
                             break;
                         }
                     case Instruction.SAR:
@@ -1696,26 +1639,7 @@ namespace Nethermind.Evm
                             if (!spec.ShiftOpcodesEnabled) goto InvalidInstruction;
                             if (!UpdateGas(GasCostOf.VeryLow, ref gasAvailable)) goto OutOfGas;
 
-                            stack.PopUInt256(out UInt256 a);
-                            stack.PopSignedInt256(out Int256.Int256 b);
-                            if (a >= BigInt256)
-                            {
-                                if (b.Sign >= 0)
-                                {
-                                    stack.PushZero();
-                                }
-                                else
-                                {
-                                    Int256.Int256 res = Int256.Int256.MinusOne;
-                                    stack.PushSignedInt256(in res);
-                                }
-                            }
-                            else
-                            {
-                                b.RightShift((int)a, out Int256.Int256 res);
-                                stack.PushSignedInt256(in res);
-                            }
-
+                            InstructionSAR(ref stack);
                             break;
                         }
                     case Instruction.EXTCODEHASH:
@@ -1723,18 +1647,7 @@ namespace Nethermind.Evm
                             if (!spec.ExtCodeHashOpcodeEnabled) goto InvalidInstruction;
                             if (!UpdateGas(spec.GetExtCodeHashCost(), ref gasAvailable)) goto OutOfGas;
 
-                            Address address = stack.PopAddress();
-                            if (!ChargeAccountAccessGas(ref gasAvailable, vmState, address, spec)) goto OutOfGas;
-
-                            if (!_state.AccountExists(address) || _state.IsDeadAccount(address))
-                            {
-                                stack.PushZero();
-                            }
-                            else
-                            {
-                                stack.PushBytes(_state.GetCodeHash(address).Bytes);
-                            }
-
+                            if (!InstructionEXTCODEHASH(ref stack, ref gasAvailable, vmState, spec)) goto OutOfGas;
                             break;
                         }
                     case Instruction.BEGINSUB:
@@ -1788,9 +1701,11 @@ namespace Nethermind.Evm
             }
 
             UpdateCurrentState(vmState, programCounter, gasAvailable, stack.Head);
-            return CallResult.Empty;
+            // Fall through to Empty: label
 
 // Common exit errors, goto labels to reduce in loop code duplication
+Empty:
+            return CallResult.Empty;
 OutOfGas:
             if (traceOpcodes) EndInstructionTraceError(gasAvailable, EvmExceptionType.OutOfGas);
             return CallResult.OutOfGasException;
