@@ -457,6 +457,7 @@ namespace Nethermind.Evm
 
             return result;
 
+            [StackTraceHidden]
             [DoesNotReturn]
             static void ThrowInvalidOperationException()
             {
